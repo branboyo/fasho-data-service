@@ -1,0 +1,21 @@
+{
+  "total": 2,
+  "jobPostings": [
+    {
+      "title": "Registered Nurse - ICU",
+      "bulletFields": ["Full time", "R-12345"],
+      "locationsText": "Chicago, IL",
+      "postedOn": "Posted 2 Days Ago",
+      "externalPath": "/en-US/job/Registered-Nurse---ICU/R-12345",
+      "timeType": "Full time"
+    },
+    {
+      "title": "Pharmacy Tech",
+      "bulletFields": ["Part time", "R-12346"],
+      "locationsText": "Evanston, IL",
+      "postedOn": "Posted 30+ Days Ago",
+      "externalPath": "/en-US/job/Pharmacy-Tech/R-12346",
+      "timeType": "Part time"
+    }
+  ]
+}
