@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 LEVER_DOMAIN = "jobs.lever.co"
+ASHBYHQ_DOMAIN = "ashbyhq.com"
 RESULTS_PER_TERM = 100
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -33,18 +34,30 @@ class LeverListing:
 
 @dataclass
 class QueryRotator:
-    """Cycles through site-scoped search terms for the Brave API."""
+    """Cycles through site-scoped search terms for the Brave API.
 
-    site: str
+    Exhausts all *terms* for the first site before moving to the next::
+
+        sites=[A, B], terms=[1, 2]  →  A+1, A+2, B+1, B+2, A+1, …
+    """
+
+    sites: list[str]
     terms: list[str]
     _index: int = field(default=0, init=False, repr=False)
 
+    @property
+    def total(self) -> int:
+        """Total number of unique (site, term) combinations."""
+        return len(self.sites) * len(self.terms)
+
     def next(self) -> str:
         """Return the next ``site:<site> <term>`` query and advance."""
-        term = self.terms[self._index % len(self.terms)]
+        i = self._index % self.total
+        site = self.sites[i // len(self.terms)]
+        term = self.terms[i % len(self.terms)]
         self._index += 1
-        query = f"site:{self.site} {term}"
-        log.debug("QueryRotator [%d/%d] → %r", self.current_index, len(self.terms), query)
+        query = f"site:{site} {term}"
+        log.debug("QueryRotator [%d/%d] site=%r → %r", i + 1, self.total, site, query)
         return query
 
     def reset(self) -> None:
@@ -52,7 +65,7 @@ class QueryRotator:
 
     @property
     def current_index(self) -> int:
-        return self._index % len(self.terms)
+        return self._index % self.total
 
 
 @dataclass
@@ -102,8 +115,8 @@ class SearchConfig:
 
 # ── Predefined query sets ─────────────────────────────────────────────────────
 
-LEVER_QUERIES = QueryRotator(
-    site=LEVER_DOMAIN,
+JOB_QUERIES = QueryRotator(
+    sites=[LEVER_DOMAIN, ASHBYHQ_DOMAIN],
     terms=[
         "tech",
         "software engineer",
@@ -143,41 +156,54 @@ def _extract_web_results(data: dict) -> list[dict]:
     return data.get("web", {}).get("results", [])
 
 
-def _sanitize_lever_url(raw_url: str) -> tuple[str, str]:
-    """Return ``(clean_url, token)`` from a raw Lever URL.
-
-    Strips the job-id path, keeping only the company slug::
-
-        https://jobs.lever.co/acme/abc-123  →  ("https://jobs.lever.co/acme/", "acme")
-    """
-    parts = [p for p in urlparse(raw_url).path.split("/") if p]
-    if not parts:
-        return raw_url, ""
-    token = parts[0]
-    return f"https://{LEVER_DOMAIN}/{token}/", token
-
-
 def _sanitize_company_name(title: str) -> str:
     """Strip everything after the first `` - `` separator."""
     return title.split(" - ", 1)[0].strip()
 
 
-def sanitize_results(raw_results: list[dict], origin_query: str) -> list[LeverListing]:
+def _extract_token(raw_url: str, site: str) -> tuple[str, str]:
+    """Return ``(clean_url, token)`` for the given *site* domain.
+
+    The token is always the first meaningful path segment (company slug)::
+
+        https://jobs.lever.co/acme/abc-123      →  ("https://jobs.lever.co/acme/", "acme")
+        https://jobs.ashbyhq.com/acme/abc-123   →  ("https://jobs.ashbyhq.com/acme/", "acme")
+    """
+    parsed = urlparse(raw_url)
+    parts = [p for p in parsed.path.split("/") if p]
+    if not parts:
+        return raw_url, ""
+    token = parts[0]
+    return f"https://{parsed.netloc}/{token}/", token
+
+
+_SITE_ATS: dict[str, str] = {
+    LEVER_DOMAIN: "lever",
+    ASHBYHQ_DOMAIN: "ashbyhq",
+}
+
+
+def sanitize_results(
+    raw_results: list[dict],
+    origin_query: str,
+    site: str,
+) -> list[LeverListing]:
     """Convert raw Brave results into deduplicated ``LeverListing`` objects.
 
-    * Filters out non-Lever URLs.
+    * Filters to results that belong to *site*.
     * Deduplicates by company token (first occurrence wins).
     * Sanitizes URLs and company names.
     """
+    ats = _SITE_ATS.get(site, site)
     seen_tokens: set[str] = set()
     listings: list[LeverListing] = []
 
     for r in raw_results:
         raw_url = r.get("url", "")
-        if LEVER_DOMAIN not in raw_url:
+        if site not in raw_url:
             continue
 
-        clean_url, token = _sanitize_lever_url(raw_url)
+        clean_url, token = _extract_token(raw_url, site)
         if not token or token in seen_tokens:
             continue
 
@@ -186,7 +212,7 @@ def sanitize_results(raw_results: list[dict], origin_query: str) -> list[LeverLi
             url=clean_url,
             company_name=_sanitize_company_name(r.get("title", "")),
             origin_query=origin_query,
-            ats="lever",
+            ats=ats,
             token=token,
         ))
 
@@ -204,7 +230,10 @@ async def search_jobs(
     """Run a single Brave search page and return sanitized listings."""
     cfg = config or SearchConfig()
     query = rotator.next()
-    origin = query.removeprefix(f"site:{rotator.site} ")
+
+    # Determine which site this query targets so sanitization filters correctly.
+    site = next((s for s in rotator.sites if f"site:{s}" in query), rotator.sites[0])
+    origin = query.removeprefix(f"site:{site} ")
     params = cfg.to_params(query)
 
     log.debug("GET %s params=%s", BRAVE_SEARCH_URL, params)
@@ -221,7 +250,7 @@ async def search_jobs(
     resp.raise_for_status()
 
     raw = _extract_web_results(resp.json())
-    listings = sanitize_results(raw, origin)
+    listings = sanitize_results(raw, origin, site)
     log.info("Query %r → %d listing(s)", query, len(listings))
     return listings
 
@@ -232,56 +261,67 @@ async def fetch_all_terms(
     *,
     config: SearchConfig | None = None,
     results_per_term: int = RESULTS_PER_TERM,
-) -> dict[str, list[LeverListing]]:
-    """Fetch all rotator terms, paginating each to *results_per_term* raw hits.
+) -> dict[str, dict[str, list[LeverListing]]]:
+    """Fetch every (site, term) combination, paginating each to *results_per_term* hits.
+
+    Returns a two-level dict keyed by ``site → term → listings``::
+
+        {
+            "jobs.lever.co":   {"tech": [...], "software engineer": [...], ...},
+            "ashbyhq.com":     {"tech": [...], "software engineer": [...], ...},
+        }
 
     Defaults to ``freshness="pw"`` (past week) unless overridden via *config*.
     """
     cfg = config or SearchConfig(freshness="pw")
     pages = max(1, results_per_term // cfg.count)
-    results: dict[str, list[LeverListing]] = {}
+    results: dict[str, dict[str, list[LeverListing]]] = {s: {} for s in rotator.sites}
     rotator.reset()
 
     log.info(
-        "Starting fetch for %d term(s) on site:%s (%d pages x %d per page)",
-        len(rotator.terms), rotator.site, pages, cfg.count,
+        "Starting fetch: %d site(s) × %d term(s) × %d page(s) = %d requests",
+        len(rotator.sites), len(rotator.terms), pages,
+        len(rotator.sites) * len(rotator.terms) * pages,
     )
 
     async with httpx.AsyncClient() as client:
-        for term in rotator.terms:
-            query = f"site:{rotator.site} {term}"
-            all_raw: list[dict] = []
+        for site in rotator.sites:
+            log.info("── site: %s ──", site)
+            for term in rotator.terms:
+                query = f"site:{site} {term}"
+                all_raw: list[dict] = []
 
-            for offset in range(pages):
-                page_cfg = replace(cfg, offset=offset)
-                params = page_cfg.to_params(query)
+                for offset in range(pages):
+                    page_cfg = replace(cfg, offset=offset)
+                    params = page_cfg.to_params(query)
 
-                log.debug("GET %s offset=%d", BRAVE_SEARCH_URL, offset)
-                resp = await client.get(
-                    BRAVE_SEARCH_URL,
-                    headers=_build_headers(api_key),
-                    params=params,
-                    timeout=15.0,
-                )
-                log.debug("Response %s for %r offset=%d", resp.status_code, query, offset)
-                resp.raise_for_status()
+                    log.debug("GET offset=%d  %r", offset, query)
+                    resp = await client.get(
+                        BRAVE_SEARCH_URL,
+                        headers=_build_headers(api_key),
+                        params=params,
+                        timeout=15.0,
+                    )
+                    log.debug("Response %s for %r offset=%d", resp.status_code, query, offset)
+                    resp.raise_for_status()
 
-                body = resp.json()
-                if "web" not in body:
-                    log.warning("No 'web' key for %r offset=%d", query, offset)
+                    body = resp.json()
+                    if "web" not in body:
+                        log.warning("No 'web' key for %r offset=%d — response: %s", query, offset, body)
 
-                raw = _extract_web_results(body)
-                all_raw.extend(raw)
+                    raw = _extract_web_results(body)
+                    all_raw.extend(raw)
 
-                if len(raw) < cfg.count:
-                    log.debug("Page %d incomplete (%d/%d), stopping", offset, len(raw), cfg.count)
-                    break
+                    if len(raw) < cfg.count:
+                        log.debug("Page %d short (%d results), stopping pagination", offset, len(raw))
+                        break
 
-            term_listings = sanitize_results(all_raw, term)
-            log.info("  %-30s -> %d listing(s) from %d raw", f'"{term}"', len(term_listings), len(all_raw))
-            results[term] = term_listings
+                term_listings = sanitize_results(all_raw, term, site)
+                log.info("  %-30s → %d listing(s) from %d raw", f'"{term}"', len(term_listings), len(all_raw))
+                results[site][term] = term_listings
 
-    log.info("Done. Total listings: %d", sum(len(v) for v in results.values()))
+    total = sum(len(lst) for terms in results.values() for lst in terms.values())
+    log.info("Done. Total listings: %d", total)
     return results
 
 
@@ -301,13 +341,15 @@ async def main(api_key: str | None = None) -> None:
     if not key:
         raise ValueError("brave_api_key not set in local-settings.yaml or FASHO_BRAVE_API_KEY")
 
-    results = await fetch_all_terms(key, LEVER_QUERIES)
+    results = await fetch_all_terms(key, JOB_QUERIES)
 
     print("\nResults summary:")
-    for term, items in results.items():
-        print(f"  {term}: {len(items)} listings")
-        for listing in items:
-            print(f"    {listing.token}: {listing.url}")
+    for site, terms in results.items():
+        print(f"\n  {site}:")
+        for term, items in terms.items():
+            print(f"    {term}: {len(items)} listings")
+            for listing in items:
+                print(f"      [{listing.ats}] {listing.token}: {listing.url}")
 
     if settings.supabase_url and settings.supabase_key:
         from app.services.token_collection.supabase_upload import get_client, upload_all_terms
